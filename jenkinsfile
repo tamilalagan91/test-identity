@@ -1,0 +1,88 @@
+node {
+  properties([[$class: 'BuildDiscarderProperty', strategy: [$class: 'LogRotator', artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '7', numToKeepStr: '5']]])
+
+  stage('Clone repository') {
+    checkout scm
+  }
+
+  stage('Update BitBucket commit build status: In Progress') {
+    withCredentials([ [ $class: 'UsernamePasswordMultiBinding', credentialsId: 'bitbucket-svcacct_tcx_ci', usernameVariable: 'bitbucketUsername', passwordVariable: 'bitbucketPassword' ], ]) {
+      gitCommitLong = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+      sh """
+        curl -s -u "${bitbucketUsername}:${bitbucketPassword}" -H 'Content-Type: application/json' -X POST -d '{ "state": "INPROGRESS", "key": "Jenkins", "name": "Jenkins", "url": "${env.BUILD_URL}console", "description": "Jenkins pipeline in progress" }' "https://bitbucket.trimble.tools/rest/build-status/1.0/commits/${gitCommitLong}"
+      """
+    }
+  }
+
+  stage('Build, tag, and push container images') {
+    bitbucketProjectName = "TCX-PRODUCT"
+    gitRepoName = "Trimble.TCX.identityservice-v4"
+
+    googleChatWebhookUrl = "https://chat.googleapis.com/v1/spaces/AAAA76MmA7Q/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=BORFZBS-wU8bT9bqWiunqm1TTF9bWossdKNceObXPos%3D"
+
+    imageRepository = "tcxcontainers.azurecr.io"
+    imageName = "tcx/identityservice"
+
+    imageTagVersionMajor = "1"
+    imageTagVersionMinor = "0"
+    imageTagVersionPatch = "${env.BUILD_NUMBER}"
+
+    gitCommitLong = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+    gitCommitShort = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+
+    imageTagVersionMajorMinor = "${imageTagVersionMajor}.${imageTagVersionMinor}"
+    imageTagVersionMajorMinorPatch = "${imageTagVersionMajorMinor}.${imageTagVersionPatch}"
+    imageTagVersionFull = "${imageTagVersionMajorMinorPatch}-${gitCommitShort}"
+
+    withCredentials([ [ $class: 'UsernamePasswordMultiBinding', credentialsId: 'bitbucket-svcacct_tcx_ci', usernameVariable: 'bitbucketUsername', passwordVariable: 'bitbucketPassword' ], ]) {
+      sshagent (credentials: ['82ad481a-5234-4b45-8ce8-d9a32b61e275']) {
+        withCredentials([ [ $class: 'UsernamePasswordMultiBinding', credentialsId: '989e304d-ead6-4539-9451-9fdbbfb02594', usernameVariable: 'dockerUserName', passwordVariable: 'dockerPassword' ], ]) {
+          withCredentials( [ string(credentialsId: 'pnet-private-scope-auth', variable: 'PNET_NPM_REPO_AUTH') ] ) {
+            withCredentials( [ string(credentialsId: 'artifactory-svcacct-tcx-ci-auth', variable: 'ARTIFACTORY_SVCACCT_TCX_CI_AUTH') ] ) {
+              withCredentials([ [ $class: 'UsernamePasswordMultiBinding', credentialsId: '49435dbd-cf4e-4593-a5c2-99927eae4426', usernameVariable: 'nugetArtifactoryUsername', passwordVariable: 'nugetArtifactoryUserApiKey' ], ]) {
+                try {
+                  sh """
+                    if [ "${env.BRANCH_NAME}" = 'test' ]; then
+                      curl -s -X POST -H 'Content-Type: application/json; charset=UTF-8' -d '{"cards":[{"header":{"title":"Jenkins CI","subtitle":"${env.JOB_NAME}","imageUrl":"https://raw.githubusercontent.com/jenkinsci/jenkins/master/war/src/main/webapp/images/headshot.png","imageStyle":"IMAGE"},"sections":[{"widgets":[{"textParagraph":{"text":"<b>Started</b> <a href=${env.BUILD_URL}console>build #${env.BUILD_NUMBER}</a> (<a href=https://bitbucket.trimble.tools/projects/${bitbucketProjectName}/repos/${gitRepoName}/commits/${gitCommitLong}>${gitCommitShort}</a>)"}}]}]}]}' '${googleChatWebhookUrl}&threadKey=${imageTagVersionFull}' >/dev/null
+                    fi
+
+                    docker pull "${imageRepository}/${imageName}:${imageTagVersionMajorMinor}" || true
+                    docker build --pull --cache-from "${imageRepository}/${imageName}:${imageTagVersionMajorMinor}" -t "${imageRepository}/${imageName}:${imageTagVersionFull}" --build-arg "PNET_NPM_REPO_AUTH=${PNET_NPM_REPO_AUTH}" --build-arg NUGET_ARTIFACTORY_USER_API_KEY="${nugetArtifactoryUserApiKey}" --build-arg ARTIFACTORY_SVCACCT_TCX_CI_AUTH="${ARTIFACTORY_SVCACCT_TCX_CI_AUTH}" --build-arg BUILD_VERSION="${imageTagVersionFull}" .
+
+                    if [ "${env.BRANCH_NAME}" = 'test' ]; then
+
+                      for IMAGE_TAG_SUPPLEMENTAL in "${imageTagVersionMajorMinorPatch}" "${imageTagVersionMajorMinor}" "${imageTagVersionMajor}" "latest"; do
+                        docker tag "${imageRepository}/${imageName}:${imageTagVersionFull}" "${imageRepository}/${imageName}:\${IMAGE_TAG_SUPPLEMENTAL}"
+                      done
+
+                      docker login -u "${dockerUserName}" -p "${dockerPassword}" "https://${imageRepository}"
+
+                      for IMAGE_TAG_TO_PUSH in "${imageTagVersionFull}" "${imageTagVersionMajorMinorPatch}" "${imageTagVersionMajorMinor}" "${imageTagVersionMajor}" "latest"; do
+                        docker push "${imageRepository}/${imageName}:\${IMAGE_TAG_TO_PUSH}"
+                      done
+
+                      curl -s -u "${bitbucketUsername}:${bitbucketPassword}" -H 'Content-Type: application/json' -X POST -d '{"message":"Tagged release during build","name":"${imageTagVersionFull}","startPoint":"${gitCommitLong}","type":"ANNOTATED"}' "https://bitbucket.trimble.tools/rest/git/latest/projects/${bitbucketProjectName}/repos/${gitRepoName}/tags"
+
+                    else
+                      echo 'Not master branch; not tagging/pushing container nor git commit'
+                    fi
+
+                    curl -s -u "${bitbucketUsername}:${bitbucketPassword}" -H 'Content-Type: application/json' -X POST -d '{ "state": "SUCCESSFUL", "key": "Jenkins", "name": "Jenkins", "url": "${env.BUILD_URL}console", "description": "Jenkins pipeline was successful" }' "https://bitbucket.trimble.tools/rest/build-status/1.0/commits/${gitCommitLong}"
+                    curl -s -X POST -H 'Content-Type: application/json; charset=UTF-8' -d '{"cards":[{"header":{"title":"Jenkins CI","subtitle":"${env.JOB_NAME}","imageUrl":"https://raw.githubusercontent.com/jenkinsci/jenkins/master/war/src/main/webapp/images/headshot.png","imageStyle":"IMAGE"},"sections":[{"widgets":[{"textParagraph":{"text":"<font color=#008000><b>Completed</b></font> <a href=${env.BUILD_URL}console>build #${env.BUILD_NUMBER}</a> (<a href=https://bitbucket.trimble.tools/projects/${bitbucketProjectName}/repos/${gitRepoName}/commits/${gitCommitLong}>${gitCommitShort}</a>) and tagged as ${imageTagVersionFull}"}}]}]}]}' '${googleChatWebhookUrl}&threadKey=${imageTagVersionFull}' >/dev/null
+                  """
+                  currentBuild.displayName = "${imageTagVersionMajorMinorPatch}-${gitCommitShort}"
+                } catch (err) {
+                  sh """
+                    curl -s -u "${bitbucketUsername}:${bitbucketPassword}" -H 'Content-Type: application/json' -X POST -d '{ "state": "FAILED", "key": "Jenkins", "name": "Jenkins", "url": "${env.BUILD_URL}console", "description": "Jenkins pipeline has failed" }' "https://bitbucket.trimble.tools/rest/build-status/1.0/commits/${gitCommitLong}"
+                    curl -s -X POST -H 'Content-Type: application/json; charset=UTF-8' -d '{"cards":[{"header":{"title":"Jenkins CI","subtitle":"${env.JOB_NAME}","imageUrl":"https://raw.githubusercontent.com/jenkinsci/jenkins/master/war/src/main/webapp/images/headshot.png","imageStyle":"IMAGE"},"sections":[{"widgets":[{"textParagraph":{"text":"<font color=#900000><b>Failed</b></font> <a href=${env.BUILD_URL}console>build #${env.BUILD_NUMBER}</a> (<a href=https://bitbucket.trimble.tools/projects/${bitbucketProjectName}/repos/${gitRepoName}/commits/${gitCommitLong}>${gitCommitShort}</a>)"}}]}]}]}' '${googleChatWebhookUrl}&threadKey=${imageTagVersionFull}' >/dev/null
+                  """
+                  error "Build failed"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
